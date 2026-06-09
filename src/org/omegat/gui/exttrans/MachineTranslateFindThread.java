@@ -39,11 +39,16 @@ import org.omegat.core.machinetranslators.MachineTranslateError;
 import org.omegat.gui.common.EntryInfoSearchThread;
 import org.omegat.util.Language;
 import org.omegat.util.Log;
+import org.omegat.util.OStrings;
 import org.omegat.util.Preferences;
 
 import java.util.Objects;
+import java.util.function.Consumer;
+
+import javax.swing.SwingUtilities;
 
 class MachineTranslateFindThread extends EntryInfoSearchThread<MachineTranslationInfo> {
+    private final MachineTranslateTextArea pane;
     private final IMachineTranslation translator;
     private final String src;
     private final boolean force;
@@ -51,6 +56,7 @@ class MachineTranslateFindThread extends EntryInfoSearchThread<MachineTranslatio
     MachineTranslateFindThread(MachineTranslateTextArea machineTranslateTextArea,
             final IMachineTranslation translator, final SourceTextEntry newEntry, boolean force) {
         super(machineTranslateTextArea, newEntry);
+        this.pane = machineTranslateTextArea;
         this.translator = translator;
         src = newEntry.getSrcText();
         this.force = force;
@@ -59,7 +65,15 @@ class MachineTranslateFindThread extends EntryInfoSearchThread<MachineTranslatio
     @Override
     protected @Nullable MachineTranslationInfo search() throws Exception {
         try {
-            return fetchTranslation(translator, src, currentlyProcessedEntry, force, this::isEntryChanged);
+            // Push each streamed chunk to the pane on the EDT, unless the user
+            // has already moved to another entry.
+            Consumer<String> partialConsumer = delta -> SwingUtilities.invokeLater(() -> {
+                if (!isEntryChanged()) {
+                    pane.appendPartialTranslation(translator.getName(), delta);
+                }
+            });
+            return fetchTranslation(translator, src, currentlyProcessedEntry, force, this::isEntryChanged,
+                    partialConsumer);
         } catch (StoppedException ex) {
             // Entry changed, cancel processing
             throw new EntryChangedException();
@@ -79,13 +93,16 @@ class MachineTranslateFindThread extends EntryInfoSearchThread<MachineTranslatio
      *            true to skip cache
      * @param isStopped
      *            callback to check if processing should stop
+     * @param partialConsumer
+     *            receives streamed chunks of the translation as they arrive
      * @return translation info, or null if unavailable
      * @throws StoppedException
      *             if isStopped returns true
      */
     @VisibleForTesting
     static @Nullable MachineTranslationInfo fetchTranslation(IMachineTranslation translator, String src,
-            SourceTextEntry entry, boolean forceLoad, IStopped isStopped) throws StoppedException {
+            SourceTextEntry entry, boolean forceLoad, IStopped isStopped, Consumer<String> partialConsumer)
+            throws StoppedException {
 
         if (isStopped.isStopped()) {
             throw new StoppedException();
@@ -113,16 +130,20 @@ class MachineTranslateFindThread extends EntryInfoSearchThread<MachineTranslatio
             }
 
             try {
-                tr = translator.getTranslation(source, target, src);
+                tr = translator.getTranslation(source, target, src, partialConsumer);
             } catch (MachineTranslateError e) {
                 Log.log(e);
+                String message = e.getLocalizedMessage() != null ? e.getLocalizedMessage() : e.getMessage();
                 Objects.requireNonNull(Core.getMainWindow())
-                        .showTimedStatusMessageRB("MT_ENGINE_ERROR", translator.getName(),
-                        e.getLocalizedMessage() != null ? e.getLocalizedMessage() : e.getMessage());
-                return null;
+                        .showTimedStatusMessageRB("MT_ENGINE_ERROR", translator.getName(), message);
+                // Return the error so the MT pane can display it instead of
+                // staying blank.
+                return new MachineTranslationInfo(translator.getName(), null, message);
             } catch (Exception e) {
                 Log.logErrorRB(e, "MT_ENGINE_EXCEPTION");
-                return null;
+                String message = e.getLocalizedMessage() != null ? e.getLocalizedMessage()
+                        : OStrings.getString("MT_ENGINE_EXCEPTION");
+                return new MachineTranslationInfo(translator.getName(), null, message);
             }
 
             if (isStopped.isStopped()) {

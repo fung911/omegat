@@ -107,7 +107,9 @@ public class MachineTranslateTextArea extends EntryInfoThreadPane<MachineTransla
                         + "; " + " font-weight: " + (font.getStyle() == Font.BOLD ? "bold" : "normal") + "; "
                         + " color: " + Styles.EditorColor.COLOR_FOREGROUND.toHex() + "; " + " background: "
                         + Styles.EditorColor.COLOR_BACKGROUND.toHex() + ";} "
-                        + ".engine {font-style: italic; text-align: right;}");
+                        + ".engine {font-style: italic; text-align: right;}"
+                        + ".mtpending {font-style: italic; color: #888888;}"
+                        + ".mterror {font-style: italic; color: #cc3333;}");
         htmlEditorKit.setStyleSheet(baseStyleSheet);
         setEditorKit(htmlEditorKit);
     }
@@ -154,6 +156,8 @@ public class MachineTranslateTextArea extends EntryInfoThreadPane<MachineTransla
     @Override
     protected void onProjectClose() {
         UIThreadsUtil.mustBeSwingThread();
+        // Stop any running "translating" animation and drop pending state.
+        controller.clearFoundResult();
         this.setText(EXPLANATION);
     }
 
@@ -169,9 +173,20 @@ public class MachineTranslateTextArea extends EntryInfoThreadPane<MachineTransla
     @Override
     protected void setFoundResult(final SourceTextEntry se, @Nullable MachineTranslationInfo data) {
         UIThreadsUtil.mustBeSwingThread();
-        if (data != null && data.result != null) {
+        if (data != null) {
+            // Forward results, errors and "nothing found" alike: the controller
+            // decides what to render and clears the pending indicator.
             controller.setFoundResult(data);
         }
+    }
+
+    /**
+     * Append a streamed chunk of translation for the given engine. Called as
+     * tokens arrive from a streaming MT engine.
+     */
+    public void appendPartialTranslation(String engineName, String delta) {
+        UIThreadsUtil.mustBeSwingThread();
+        controller.appendPartial(engineName, delta);
     }
 
     @Override

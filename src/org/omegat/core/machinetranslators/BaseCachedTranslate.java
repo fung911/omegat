@@ -28,6 +28,7 @@
 package org.omegat.core.machinetranslators;
 
 import java.util.OptionalLong;
+import java.util.function.Consumer;
 
 import javax.cache.Cache;
 import javax.cache.CacheManager;
@@ -121,6 +122,17 @@ public abstract class BaseCachedTranslate extends BaseTranslate implements IMach
     }
 
     @Override
+    public final @Nullable String getTranslation(Language sLang, Language tLang, String text,
+            Consumer<String> partialConsumer) throws Exception {
+        if (enabled) {
+            String trText = getTruncateText(text);
+            return putCache(sLang, tLang, trText, translate(sLang, tLang, trText, partialConsumer));
+        } else {
+            return null;
+        }
+    }
+
+    @Override
     public final @Nullable String getCachedTranslation(Language sLang, Language tLang, String text) {
         if (enabled) {
             return getCache(sLang, tLang, getTruncateText(text));
@@ -132,6 +144,20 @@ public abstract class BaseCachedTranslate extends BaseTranslate implements IMach
     protected abstract String getPreferenceName();
 
     protected abstract @Nullable String translate(Language sLang, Language tLang, String text) throws Exception;
+
+    /**
+     * Streaming variant of {@link #translate(Language, Language, String)}.
+     * Connectors that can produce output incrementally override this and feed
+     * each chunk to {@code partialConsumer}. The default implementation ignores
+     * the consumer and performs a normal, non-streaming translation.
+     *
+     * @param partialConsumer
+     *            receives incremental chunks of the translation
+     */
+    protected @Nullable String translate(Language sLang, Language tLang, String text,
+            Consumer<String> partialConsumer) throws Exception {
+        return translate(sLang, tLang, text);
+    }
 
     private String getCache(Language sLang, Language tLang, String text) {
         return cache.get(sLang + "/" + tLang + "/" + text);

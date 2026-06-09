@@ -31,10 +31,16 @@ package org.omegat.gui.exttrans;
 
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.Iterator;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.stream.Collectors;
+
+import javax.swing.Timer;
 
 import org.jetbrains.annotations.Nullable;
 import org.jetbrains.annotations.VisibleForTesting;
@@ -42,12 +48,19 @@ import org.omegat.core.Core;
 import org.omegat.core.data.CoreState;
 import org.omegat.core.data.SourceTextEntry;
 import org.omegat.gui.glossary.GlossaryEntry;
+import org.omegat.util.OStrings;
 
 /**
  * Controller for MachineTranslateTextArea following MVC. Responsible for
  * orchestrating MT searches and managing search threads.
  */
 public class MachineTranslateController {
+    private static final int ANIM_INTERVAL_MS = 30;
+    private static final int REVEAL_MIN_STEP = 2;
+    private static final int REVEAL_DIVISOR = 12;
+    private static final int SPINNER_SLOWDOWN = 6;
+    private static final char[] SPINNER = {'|', '/', '-', '\\'};
+
     private final MachineTranslateTextArea view;
     private final List<MachineTranslateFindThread> searchThreads = new ArrayList<>();
 
@@ -58,9 +71,34 @@ public class MachineTranslateController {
      */
     private final List<MachineTranslationInfo> displayed = new CopyOnWriteArrayList<>();
 
+    /** Engines whose request is currently in flight (shown as "translating"). */
+    private final Set<String> pending = new LinkedHashSet<>();
+
+    /** Engines that failed, mapped to their error message. */
+    private final Map<String, String> errors = new LinkedHashMap<>();
+
+    /** Engines that stream, mapped to the full text received so far. */
+    private final Map<String, String> partial = new LinkedHashMap<>();
+
+    /** How many characters of each engine's text are currently revealed. */
+    private final Map<String, Integer> revealed = new LinkedHashMap<>();
+
+    /** Completed engines whose typewriter reveal has not yet caught up. */
+    private final Map<String, MachineTranslationInfo> finalizing = new LinkedHashMap<>();
+
+    /** Drives the animated indicator and the typewriter reveal while requests run. */
+    private final Timer pendingTimer;
+    private int animationTick;
+
     public MachineTranslateController(MachineTranslateTextArea view) {
         this.view = view;
         selectedIndex = -1;
+        pendingTimer = new Timer(ANIM_INTERVAL_MS, e -> {
+            animationTick++;
+            advanceReveal();
+            promoteFinishedReveals();
+            render();
+        });
         setGlossaryMap();
     }
 
@@ -112,24 +150,153 @@ public class MachineTranslateController {
     }
 
     void setFoundResult(MachineTranslationInfo data) {
-        displayed.add(data);
-        displayed.sort(Comparator.comparing(info -> info.translatorName));
+        String name = data.translatorName;
+        if (data.result != null && partial.containsKey(name)) {
+            // The engine produced streamed text (or one fallback chunk): keep it
+            // "pending" and let the timer finish the typewriter reveal before
+            // promoting it to a final, selectable result. This guarantees a
+            // visible character-by-character effect even when the whole response
+            // arrived in a single burst.
+            errors.remove(name);
+            partial.put(name, data.result);
+            finalizing.put(name, data);
+            if (!pendingTimer.isRunning()) {
+                startPendingAnimation();
+            }
+        } else {
+            // Instant result (e.g. a cache hit) or an error / nothing found.
+            pending.remove(name);
+            partial.remove(name);
+            revealed.remove(name);
+            finalizing.remove(name);
+            if (data.result != null) {
+                errors.remove(name);
+                displayed.add(data);
+                displayed.sort(Comparator.comparing(info -> info.translatorName));
+            } else if (data.errorMessage != null) {
+                errors.put(name, data.errorMessage);
+            }
+            if (pending.isEmpty()) {
+                stopPendingAnimation();
+            }
+        }
+        render();
+    }
+
+    /**
+     * Accumulate a streamed chunk for an engine. The pane is not refreshed here;
+     * the timer reveals the accumulated text at a steady pace so the typewriter
+     * effect stays visible regardless of how fast the chunks actually arrive.
+     */
+    void appendPartial(String engineName, String delta) {
+        if (pending.contains(engineName)) {
+            partial.merge(engineName, delta, String::concat);
+        }
+    }
+
+    /** Advance the revealed-character count of each streaming engine by one step. */
+    private void advanceReveal() {
+        for (String name : pending) {
+            String full = partial.get(name);
+            if (full == null) {
+                continue;
+            }
+            int shown = revealed.getOrDefault(name, 0);
+            if (shown < full.length()) {
+                int gap = full.length() - shown;
+                int step = Math.max(REVEAL_MIN_STEP, gap / REVEAL_DIVISOR);
+                revealed.put(name, Math.min(full.length(), shown + step));
+            }
+        }
+    }
+
+    /** Promote completed engines to final results once their reveal has caught up. */
+    private void promoteFinishedReveals() {
+        Iterator<Map.Entry<String, MachineTranslationInfo>> it = finalizing.entrySet().iterator();
+        while (it.hasNext()) {
+            Map.Entry<String, MachineTranslationInfo> entry = it.next();
+            String name = entry.getKey();
+            String full = partial.get(name);
+            int shown = revealed.getOrDefault(name, 0);
+            if (full == null || shown >= full.length()) {
+                displayed.add(entry.getValue());
+                displayed.sort(Comparator.comparing(info -> info.translatorName));
+                pending.remove(name);
+                partial.remove(name);
+                revealed.remove(name);
+                it.remove();
+            }
+        }
+        if (pending.isEmpty()) {
+            stopPendingAnimation();
+        }
+    }
+
+    /**
+     * Rebuild the pane: successful results first (these are selectable for
+     * insertion), then errors, then an animated "translating" row for every
+     * engine whose request is still in flight.
+     */
+    private void render() {
         StringBuilder sb = new StringBuilder("<html>");
         for (int i = 0; i < displayed.size(); i++) {
             MachineTranslationInfo info = displayed.get(i);
             sb.append("<div id=\"").append(i).append("\">");
             sb.append(info.result);
-            sb.append("<div class=\"engine\">&lt;");
-            sb.append(info.translatorName);
-            sb.append("&gt;</div></div>");
+            sb.append("<div class=\"engine\">&lt;").append(escapeHtml(info.translatorName))
+                    .append("&gt;</div></div>");
+        }
+        for (Map.Entry<String, String> error : errors.entrySet()) {
+            sb.append("<div class=\"mterror\">").append(escapeHtml(error.getValue()));
+            sb.append("<div class=\"engine\">&lt;").append(escapeHtml(error.getKey()))
+                    .append("&gt;</div></div>");
+        }
+        if (!pending.isEmpty()) {
+            char spinner = SPINNER[(animationTick / SPINNER_SLOWDOWN) % SPINNER.length];
+            String label = OStrings.getString("MT_PENDING");
+            for (String name : pending) {
+                sb.append("<div class=\"mtpending\">");
+                String full = partial.get(name);
+                if (full != null && !full.isEmpty()) {
+                    // Streaming under way: reveal the text so far with a cursor.
+                    int shown = Math.min(revealed.getOrDefault(name, 0), full.length());
+                    sb.append(escapeHtml(full.substring(0, shown))).append(spinner);
+                } else {
+                    // Request sent, nothing back yet.
+                    sb.append(spinner).append(' ').append(label);
+                }
+                sb.append("<div class=\"engine\">&lt;").append(escapeHtml(name))
+                        .append("&gt;</div></div>");
+            }
         }
         sb.append("</html>");
         view.setText(sb.toString());
     }
 
+    private void startPendingAnimation() {
+        animationTick = 0;
+        if (!pendingTimer.isRunning()) {
+            pendingTimer.start();
+        }
+    }
+
+    private void stopPendingAnimation() {
+        pendingTimer.stop();
+    }
+
+    private static String escapeHtml(String text) {
+        return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;");
+    }
+
     void clearFoundResult() {
         displayed.clear();
+        errors.clear();
+        pending.clear();
+        partial.clear();
+        revealed.clear();
+        finalizing.clear();
         selectedIndex = -1;
+        stopPendingAnimation();
     }
 
     /**
@@ -149,12 +316,17 @@ public class MachineTranslateController {
         synchronized (searchThreads) {
             for (IMachineTranslation mt : getMachineTranslators()) {
                 if (mt.isEnabled()) {
+                    pending.add(mt.getName());
                     MachineTranslateFindThread mtSearchThread = new MachineTranslateFindThread(view, mt,
                             newEntry, force);
                     searchThreads.add(mtSearchThread);
                     mtSearchThread.start();
                 }
             }
+        }
+        if (!pending.isEmpty()) {
+            startPendingAnimation();
+            render();
         }
     }
 

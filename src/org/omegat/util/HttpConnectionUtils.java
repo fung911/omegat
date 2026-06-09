@@ -28,12 +28,14 @@
 
 package org.omegat.util;
 
+import java.io.BufferedReader;
 import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.FileNotFoundException;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.InputStreamReader;
 import java.io.OutputStream;
 import java.net.HttpURLConnection;
 import java.net.URI;
@@ -46,6 +48,7 @@ import java.util.Base64;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.function.Consumer;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -407,9 +410,32 @@ public final class HttpConnectionUtils {
      */
     public static String postJSON(String address, String json, Map<String, String> additionalHeaders)
             throws IOException {
+        return postJSON(address, json, additionalHeaders, 0);
+    }
+
+    /**
+     * Post JSON data to the remote URL with an optional connect/read timeout.
+     *
+     * @param address
+     *            address to post
+     * @param json
+     *            JSON-encoded data
+     * @param additionalHeaders
+     *            additional headers for request, can be null
+     * @param timeoutMs
+     *            connect and read timeout in milliseconds; 0 means no timeout
+     *            (the JVM default, which can block indefinitely)
+     * @return Server output
+     */
+    public static String postJSON(String address, String json, Map<String, String> additionalHeaders,
+            int timeoutMs) throws IOException {
         URL url = new URL(address);
 
         HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+        if (timeoutMs > 0) {
+            conn.setConnectTimeout(timeoutMs);
+            conn.setReadTimeout(timeoutMs);
+        }
         conn.setRequestMethod("POST");
         conn.setRequestProperty("Content-Type", "application/json");
         conn.setRequestProperty("Content-Length", Integer.toString(json.length()));
@@ -428,6 +454,66 @@ public final class HttpConnectionUtils {
             cout.write(json.getBytes(StandardCharsets.UTF_8));
             cout.flush();
             return getStringContent(conn, "utf-8");
+        } finally {
+            conn.disconnect();
+        }
+    }
+
+    /**
+     * Post JSON data and read the response line by line, passing each line to
+     * {@code lineConsumer} as soon as it is read. Intended for
+     * server-sent-event (SSE) style streaming responses. Honours the proxy
+     * settings and an optional connect/read timeout.
+     *
+     * @param address
+     *            address to post
+     * @param json
+     *            JSON-encoded data
+     * @param additionalHeaders
+     *            additional headers for request, can be null
+     * @param timeoutMs
+     *            connect and read timeout in milliseconds; 0 means no timeout
+     * @param lineConsumer
+     *            receives each response line as it is read
+     */
+    public static void postJSONStreaming(String address, String json, Map<String, String> additionalHeaders,
+            int timeoutMs, Consumer<String> lineConsumer) throws IOException {
+        URL url = new URL(address);
+
+        HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+        if (timeoutMs > 0) {
+            conn.setConnectTimeout(timeoutMs);
+            conn.setReadTimeout(timeoutMs);
+        }
+        conn.setRequestMethod("POST");
+        conn.setRequestProperty("Content-Type", "application/json");
+        conn.setRequestProperty("Content-Length", Integer.toString(json.length()));
+        if (additionalHeaders != null) {
+            for (Map.Entry<String, String> en : additionalHeaders.entrySet()) {
+                conn.setRequestProperty(en.getKey(), en.getValue());
+            }
+        }
+
+        addProxyAuthentication(conn);
+
+        conn.setDoInput(true);
+        conn.setDoOutput(true);
+
+        try {
+            try (OutputStream cout = conn.getOutputStream()) {
+                cout.write(json.getBytes(StandardCharsets.UTF_8));
+                cout.flush();
+            }
+            if (conn.getResponseCode() != HttpURLConnection.HTTP_OK) {
+                throw new ResponseError(conn);
+            }
+            try (BufferedReader reader = new BufferedReader(
+                    new InputStreamReader(conn.getInputStream(), StandardCharsets.UTF_8))) {
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    lineConsumer.accept(line);
+                }
+            }
         } finally {
             conn.disconnect();
         }

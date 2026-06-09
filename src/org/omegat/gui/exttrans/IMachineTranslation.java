@@ -27,6 +27,7 @@
 package org.omegat.gui.exttrans;
 
 import java.awt.Window;
+import java.util.function.Consumer;
 import java.util.logging.Logger;
 
 import org.jspecify.annotations.Nullable;
@@ -81,6 +82,31 @@ public interface IMachineTranslation {
      */
     @Nullable
     String getTranslation(Language sLang, Language tLang, String text) throws Exception;
+
+    /**
+     * Translate, receiving the result incrementally as it is produced.
+     * <p>
+     * Engines that support streaming push each partial chunk to
+     * {@code partialConsumer} as it arrives, and still return the full text.
+     * The default implementation delegates to
+     * {@link #getTranslation(Language, Language, String)} and never calls the
+     * consumer, so non-streaming engines keep working unchanged.
+     *
+     * @param sLang
+     *            source language
+     * @param tLang
+     *            target language
+     * @param text
+     *            text for translation
+     * @param partialConsumer
+     *            receives incremental chunks of the translation
+     * @return the complete translated text, or null if impossible
+     */
+    @Nullable
+    default String getTranslation(Language sLang, Language tLang, String text,
+            Consumer<String> partialConsumer) throws Exception {
+        return getTranslation(sLang, tLang, text);
+    }
 
     /**
      * Get cached translation. Returns null if translation not present.

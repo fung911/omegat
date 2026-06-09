@@ -26,9 +26,13 @@
 package org.omegat.machinetranslators.llm;
 
 import java.awt.Window;
+import java.io.IOException;
+import java.net.SocketTimeoutException;
+import java.text.MessageFormat;
 import java.util.Map;
 import java.util.ResourceBundle;
 import java.util.TreeMap;
+import java.util.function.Consumer;
 
 import javax.swing.JButton;
 import javax.swing.JLabel;
@@ -89,6 +93,15 @@ public class LLMTranslate extends BaseCachedTranslate {
     private static final String BUNDLE_BASENAME = "org.omegat.machinetranslators.llm.Bundle";
     private static final ResourceBundle BUNDLE = ResourceBundle.getBundle(BUNDLE_BASENAME);
 
+    /** Shared, thread-safe JSON mapper. */
+    private static final ObjectMapper MAPPER = new ObjectMapper();
+
+    /** Maximum length of an API error body echoed back to the user. */
+    private static final int MAX_ERROR_DETAIL = 300;
+
+    /** Connect/read timeout for the API call, so a dead endpoint fails fast. */
+    private static final int REQUEST_TIMEOUT_MS = 60_000;
+
     /**
      * Register the connector into OmegaT.
      */
@@ -111,21 +124,143 @@ public class LLMTranslate extends BaseCachedTranslate {
 
     @Override
     protected @Nullable String translate(Language sLang, Language tLang, String text) throws Exception {
-        String apiKey = getCredential(PROPERTY_API_KEY);
         String prompt = renderPrompt(getPromptTemplate(), sLang, tLang, text);
-        String json = createJsonRequest(getModel(), prompt);
+        String json = createJsonRequest(getModel(), prompt, false);
+        String response = post(getApiUrl(), json, buildHeaders(false));
+        return cleanSpacesAroundTags(getJsonResults(response), text);
+    }
 
+    @Override
+    protected @Nullable String translate(Language sLang, Language tLang, String text,
+            Consumer<String> partialConsumer) throws Exception {
+        String prompt = renderPrompt(getPromptTemplate(), sLang, tLang, text);
+        String json = createJsonRequest(getModel(), prompt, true);
+        String full = postStreaming(getApiUrl(), json, buildHeaders(true), partialConsumer);
+        return cleanSpacesAroundTags(full, text);
+    }
+
+    private Map<String, String> buildHeaders(boolean streaming) {
+        String apiKey = getCredential(PROPERTY_API_KEY);
         Map<String, String> headers = new TreeMap<>();
-        headers.put("Accept", "application/json");
+        headers.put("Accept", streaming ? "text/event-stream" : "application/json");
         // Local providers such as Ollama or LM Studio need no key; only send the
         // Authorization header when one is configured.
         if (!apiKey.isEmpty()) {
             headers.put("Authorization", "Bearer " + apiKey);
         }
+        return headers;
+    }
 
-        String response = HttpConnectionUtils.postJSON(getApiUrl(), json, headers);
-        String translation = getJsonResults(response);
-        return cleanSpacesAroundTags(translation, text);
+    /**
+     * POST the request body and translate any low-level network failure into a
+     * {@link MachineTranslateError} that carries a human-readable message. This
+     * is what lets OmegaT report timeouts, wrong URLs and rejected keys to the
+     * user (in the status bar, prefixed with the engine name) instead of
+     * failing silently.
+     */
+    protected String post(String url, String json, Map<String, String> headers) throws MachineTranslateError {
+        try {
+            return HttpConnectionUtils.postJSON(url, json, headers, REQUEST_TIMEOUT_MS);
+        } catch (HttpConnectionUtils.ResponseError e) {
+            // The server answered with a non-200 status (bad key, unknown model,
+            // wrong path...). Echo the API's own error body, which is the most
+            // useful diagnostic.
+            Log.log(e);
+            String detail = (e.body != null && !e.body.isEmpty()) ? e.body.trim() : e.message;
+            if (detail.length() > MAX_ERROR_DETAIL) {
+                detail = detail.substring(0, MAX_ERROR_DETAIL) + "…";
+            }
+            throw new MachineTranslateError(
+                    MessageFormat.format(BUNDLE.getString("MT_ENGINE_LLM_HTTP_ERROR"), e.code, detail));
+        } catch (SocketTimeoutException e) {
+            Log.log(e);
+            throw new MachineTranslateError(BUNDLE.getString("MT_ENGINE_LLM_TIMEOUT"));
+        } catch (IOException e) {
+            // Unknown host, connection refused, DNS failure, malformed URL, etc.
+            Log.log(e);
+            String reason = e.getMessage() != null ? e.getMessage() : e.toString();
+            throw new MachineTranslateError(
+                    MessageFormat.format(BUNDLE.getString("MT_ENGINE_LLM_CONNECTION_ERROR"), url, reason));
+        }
+    }
+
+    /**
+     * Stream the response as OpenAI server-sent events, pushing each token to
+     * {@code partialConsumer} as it arrives and returning the assembled text.
+     * Network failures are mapped to {@link MachineTranslateError} exactly like
+     * {@link #post(String, String, Map)}.
+     */
+    protected String postStreaming(String url, String json, Map<String, String> headers,
+            Consumer<String> partialConsumer) throws Exception {
+        StringBuilder assembled = new StringBuilder();
+        StringBuilder rawBody = new StringBuilder();
+        try {
+            HttpConnectionUtils.postJSONStreaming(url, json, headers, REQUEST_TIMEOUT_MS, line -> {
+                rawBody.append(line).append('\n');
+                String delta = parseSseDelta(line);
+                if (delta != null && !delta.isEmpty()) {
+                    assembled.append(delta);
+                    partialConsumer.accept(delta);
+                }
+            });
+        } catch (HttpConnectionUtils.ResponseError e) {
+            Log.log(e);
+            String detail = (e.body != null && !e.body.isEmpty()) ? e.body.trim() : e.message;
+            if (detail.length() > MAX_ERROR_DETAIL) {
+                detail = detail.substring(0, MAX_ERROR_DETAIL) + "…";
+            }
+            throw new MachineTranslateError(
+                    MessageFormat.format(BUNDLE.getString("MT_ENGINE_LLM_HTTP_ERROR"), e.code, detail));
+        } catch (SocketTimeoutException e) {
+            Log.log(e);
+            throw new MachineTranslateError(BUNDLE.getString("MT_ENGINE_LLM_TIMEOUT"));
+        } catch (IOException e) {
+            Log.log(e);
+            String reason = e.getMessage() != null ? e.getMessage() : e.toString();
+            throw new MachineTranslateError(
+                    MessageFormat.format(BUNDLE.getString("MT_ENGINE_LLM_CONNECTION_ERROR"), url, reason));
+        }
+        if (assembled.length() == 0) {
+            // The server ignored stream:true and returned a single JSON body.
+            // Parse it as a normal completion so we never return an empty result.
+            String full = getJsonResults(rawBody.toString());
+            partialConsumer.accept(full);
+            return full;
+        }
+        return assembled.toString();
+    }
+
+    /**
+     * Extract the incremental <code>choices[0].delta.content</code> from a
+     * single SSE line, or return null for blank, keep-alive or
+     * <code>[DONE]</code> lines.
+     */
+    private @Nullable String parseSseDelta(String line) {
+        if (!line.startsWith("data:")) {
+            return null;
+        }
+        String payload = line.substring("data:".length()).trim();
+        if (payload.isEmpty() || "[DONE]".equals(payload)) {
+            return null;
+        }
+        try {
+            JsonNode node = MAPPER.readTree(payload);
+            JsonNode choices = node.get("choices");
+            if (choices != null && choices.has(0)) {
+                JsonNode delta = choices.get(0).get("delta");
+                JsonNode content = delta == null ? null : delta.get("content");
+                // Only real string content counts. Role-only or keep-alive
+                // chunks carry a JSON null here, whose asText() would otherwise
+                // yield the literal string "null".
+                if (content != null && content.isTextual()) {
+                    return content.asText();
+                }
+            }
+        } catch (IOException e) {
+            // Ignore an unparseable keep-alive/comment line and keep reading.
+            Log.log(e);
+        }
+        return null;
     }
 
     /**
@@ -139,18 +274,29 @@ public class LLMTranslate extends BaseCachedTranslate {
     }
 
     /**
-     * Build the OpenAI chat-completion request body.
+     * Build a non-streaming OpenAI chat-completion request body.
      */
     protected String createJsonRequest(String model, String prompt) throws JsonProcessingException {
-        ObjectMapper mapper = new ObjectMapper();
-        ObjectNode root = mapper.createObjectNode();
+        return createJsonRequest(model, prompt, false);
+    }
+
+    /**
+     * Build the OpenAI chat-completion request body, optionally enabling the
+     * streaming response mode.
+     */
+    protected String createJsonRequest(String model, String prompt, boolean stream)
+            throws JsonProcessingException {
+        ObjectNode root = MAPPER.createObjectNode();
         root.put("model", model);
         ArrayNode messages = root.putArray("messages");
         ObjectNode message = messages.addObject();
         message.put("role", "user");
         message.put("content", prompt);
         root.put("temperature", 0);
-        return mapper.writeValueAsString(root);
+        if (stream) {
+            root.put("stream", true);
+        }
+        return MAPPER.writeValueAsString(root);
     }
 
     /**
@@ -161,10 +307,9 @@ public class LLMTranslate extends BaseCachedTranslate {
      * @return the translated text.
      */
     protected String getJsonResults(String json) throws Exception {
-        ObjectMapper mapper = new ObjectMapper();
         JsonNode rootNode;
         try {
-            rootNode = mapper.readTree(json);
+            rootNode = MAPPER.readTree(json);
         } catch (Exception e) {
             Log.logErrorRB(e, "MT_JSON_ERROR");
             throw new MachineTranslateError(BUNDLE.getString("MT_JSON_ERROR"));

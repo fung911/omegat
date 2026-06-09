@@ -37,9 +37,17 @@ import org.jspecify.annotations.Nullable;
 public class MachineTranslationInfo {
     public final String translatorName;
     public final @Nullable String result;
+    /** Set when the engine failed; mutually exclusive with {@link #result}. */
+    public final @Nullable String errorMessage;
 
     public MachineTranslationInfo(String translatorName, @Nullable String result) {
+        this(translatorName, result, null);
+    }
+
+    public MachineTranslationInfo(String translatorName, @Nullable String result,
+            @Nullable String errorMessage) {
         this.translatorName = translatorName;
         this.result = result;
+        this.errorMessage = errorMessage;
     }
 }
